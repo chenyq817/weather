@@ -1,0 +1,78 @@
+name: weather-classification
+title: 天气图片分类
+version: 1.0.0
+description: >
+  基于 EfficientNet-B0 的天气图片四分类应用。
+  支持识别晴天(sunny)、雨天(rainy)、阴天(cloudy)、雪天(snowy)四种天气类型。
+  适用于自动驾驶、智能农业、交通气象监测等场景。
+
+module:
+  name: weather_classifier
+  handler: handler.handle
+  runtime: python3
+  framework: pytorch
+
+# 输入参数 (Mo平台会自动从handle函数提取, 此处为补充说明)
+input:
+  - name: image_input
+    type: string
+    description: 待分类的图片（支持文件路径或Base64编码）
+    required: true
+    example: "./test.jpg"
+
+  - name: model_path
+    type: string
+    description: 模型权重文件路径
+    required: false
+    default: "best_model.pth"
+
+# 输出结果
+output:
+  - name: prediction
+    type: string
+    description: 预测的天气类别 (sunny/rainy/cloudy/snowy)
+
+  - name: prediction_cn
+    type: string
+    description: 中文天气类别 (晴天/雨天/阴天/雪天)
+
+  - name: confidence
+    type: float
+    description: 预测置信度 (0~1)
+
+  - name: probabilities
+    type: object
+    description: 各类别概率分布
+
+  - name: all_predictions
+    type: array
+    description: 按概率降序排列的各类别预测详情
+
+  - name: inference_time_ms
+    type: float
+    description: 推理耗时 (毫秒)
+
+# 依赖
+dependencies:
+  - torch>=2.0.0
+  - torchvision>=0.15.0
+  - numpy>=1.24.0
+  - Pillow>=9.5.0
+
+# 包含的文件
+files:
+  - handler.py
+  - best_model.pth
+  - app_spec.yml
+
+# 模型信息
+model_info:
+  architecture: EfficientNet-B0
+  parameters: "5.3M"
+  input_size: "224x224"
+  num_classes: 4
+  classes:
+    - sunny
+    - rainy
+    - cloudy
+    - snowy

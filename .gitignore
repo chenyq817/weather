@@ -1,0 +1,10 @@
+data/
+output/
+__pycache__/
+*.pth
+*.log
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.webp
