@@ -19,7 +19,7 @@ from torchvision import transforms, models
 # ======== 全局配置 ========
 IMAGE_SIZE = 224
 NUM_CLASSES = 4
-CLASS_NAMES = ["sunny", "rainy", "cloudy", "snowy"]
+CLASS_NAMES = ["cloudy", "rain", "shine", "sunrise"]
 DEVICE = torch.device("cpu")  # 部署环境可能无GPU，用CPU保证兼容
 
 # 图片预处理
@@ -135,10 +135,10 @@ def handle(image_input, model_path="best_model.pth"):
     # 4. 构建结果
     pred_idx = int(np.argmax(probs))
     cn_map = {
-        "sunny": "晴天",
-        "rainy": "雨天",
         "cloudy": "阴天",
-        "snowy": "雪天",
+        "rain": "雨天",
+        "shine": "晴天",
+        "sunrise": "日出",
     }
 
     all_predictions = []

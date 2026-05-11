@@ -32,7 +32,7 @@ NUM_EPOCHS = 60
 LEARNING_RATE = 1e-3
 FINE_TUNE_LR = 1e-4
 NUM_CLASSES = 4
-CLASS_NAMES = ["sunny", "rainy", "cloudy", "snowy"]
+CLASS_NAMES = ["cloudy", "rain", "shine", "sunrise"]
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---- 数据增强 ----

@@ -13,7 +13,7 @@ SRC_BASE = "c:/Users/19709/Desktop/睿抗/69f46e75dbb43ba9e05483c1/weather_class
 DST_BASE = "c:/Users/19709/Desktop/睿抗/weather_classification/data"
 
 # 选取的4个类别
-CLASSES = ["sunny", "rainy", "cloudy", "snow"]
+CLASSES = ["cloudy", "rain", "shine", "sunrise"]
 
 # 每个类别抽样数量
 TRAIN_PER_CLASS = 800

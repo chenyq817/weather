@@ -3,7 +3,7 @@ title: 天气图片分类
 version: 1.0.0
 description: >
   基于 EfficientNet-B0 的天气图片四分类应用。
-  支持识别晴天(sunny)、雨天(rainy)、阴天(cloudy)、雪天(snowy)四种天气类型。
+  支持识别阴天(cloudy)、雨天(rain)、晴天(shine)、日出(sunrise)四种天气类型。
   适用于自动驾驶、智能农业、交通气象监测等场景。
 
 module:
@@ -30,7 +30,7 @@ input:
 output:
   - name: prediction
     type: string
-    description: 预测的天气类别 (sunny/rainy/cloudy/snowy)
+    description: 预测的天气类别 (cloudy/rain/shine/sunrise)
 
   - name: prediction_cn
     type: string
@@ -72,7 +72,7 @@ model_info:
   input_size: "224x224"
   num_classes: 4
   classes:
-    - sunny
-    - rainy
     - cloudy
-    - snowy
+    - rain
+    - shine
+    - sunrise

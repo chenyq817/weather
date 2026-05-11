@@ -22,7 +22,7 @@ for d in [OUTPUT_DIR, CKPT_DIR, LOG_DIR]:
 
 # ============ 天气类别 ============
 # 根据比赛数据调整，常见四类:
-CLASS_NAMES = ["sunny", "rainy", "cloudy", "snow"]
+CLASS_NAMES = ["cloudy", "rain", "shine", "sunrise"]
 NUM_CLASSES = len(CLASS_NAMES)
 
 # ============ 模型配置 ============
