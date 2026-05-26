@@ -13,7 +13,9 @@ from sklearn.metrics import f1_score, accuracy_score, classification_report, con
 from sklearn.model_selection import train_test_split
 
 # ============ 可配置参数 ============
-DATA_DIR = "-d/weather_classification"          # MO平台数据路径
+# MO平台数据路径 — 会自动探测, 也可手动指定
+# 常见路径: /home/jovyan/data/ 或 /data/ 或 -d/
+DATA_DIR = None  # None=自动探测, 或手动写 "/home/jovyan/data/weather_classification"
 TRAIN_PER_CLASS = 800                           # 训练集每类数量
 TEST_PER_CLASS = 200                            # 测试集每类数量
 USE_PRETRAINED = False                          # 是否加载天气预训练权重 (同数据=False)
@@ -36,6 +38,30 @@ print(f"Data: {DATA_DIR} | {TRAIN_PER_CLASS}/{TEST_PER_CLASS} per class")
 print(f"Pretrained: {PRETRAINED_MODEL}")
 
 # ============ 数据准备 ============
+def auto_detect_data_dir():
+    """自动探测MO平台数据路径"""
+    candidates = [
+        "-d/weather_classification",
+        "/home/jovyan/data/weather_classification",
+        "/home/jovyan/-d/weather_classification",
+        "/data/weather_classification",
+        "../data/weather_classification",
+        "data/weather_classification",
+    ]
+    for path in candidates:
+        test_dir = os.path.join(path, "cloudy")
+        if os.path.isdir(test_dir):
+            return path
+    # 都没找到, 列出可能的目录帮助排查
+    print("Auto-detect failed. Checking filesystem...")
+    for root in ["/home/jovyan", "/home/jovyan/data", "/data", ".", ".."]:
+        if os.path.isdir(root):
+            print(f"  {root}/: {os.listdir(root)[:10]}")
+    raise FileNotFoundError(
+        f"Cannot find weather_classification directory. "
+        f"Tried: {candidates}. Set DATA_DIR manually in train_mo.py"
+    )
+
 def prepare_data(data_dir, train_per_class, test_per_class):
     """从原始6类数据中提取4类, 划分train/test, 复制到临时目录"""
     print(f"\nPreparing data from {data_dir}...")
@@ -165,8 +191,12 @@ def tta_predict(model, img):
 
 # ============ Main ============
 if __name__ == "__main__":
+    # 自动探测数据路径
+    data_dir = DATA_DIR if DATA_DIR else auto_detect_data_dir()
+    print(f"Using data dir: {data_dir}")
+
     # Step 1: 准备数据
-    data_path = prepare_data(DATA_DIR, TRAIN_PER_CLASS, TEST_PER_CLASS)
+    data_path = prepare_data(data_dir, TRAIN_PER_CLASS, TEST_PER_CLASS)
 
     # Step 2: 加载数据
     tr_ds = WeatherDS(os.path.join(data_path, "train"), train_tf)
