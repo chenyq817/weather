@@ -308,17 +308,52 @@ if __name__ == "__main__":
                 except: pass
                 if found: break
 
-        # 方法3: 找任何包含 zip/tar 的目录（数据集可能未解压）
+        # 方法3: 找压缩包并解压
         if not found:
-            print("  No dataset dir found. Checking for archives...")
-            try:
-                r = subprocess.run(["find", "/home", "/data", "/dataset", "-maxdepth", "4",
-                                   "-type", "f", "-name", "*.zip", "-o", "-name", "*.tar*"],
-                                  capture_output=True, text=True, timeout=15)
-                for line in r.stdout.strip().split("\n"):
-                    if line.strip():
-                        print(f"  Archive: {line.strip()}")
-            except: pass
+            print("  Looking for compressed dataset archives...")
+            import glob as _glob
+            archive_patterns = ["*.zip", "*.tar", "*.tar.gz", "*.tgz", "*.tar.bz2"]
+            archives = []
+            for root in ["/home", "/data", "/dataset", "/mnt", "/opt", ".", "-d"]:
+                if not os.path.isdir(root): continue
+                for pat in archive_patterns:
+                    archives.extend(_glob.glob(os.path.join(root, "**", pat), recursive=True)[:5])
+            archives = archives[:10]
+            if archives:
+                print(f"  Found archives: {archives}")
+                extract_dir = "dataset_extracted"
+                os.makedirs(extract_dir, exist_ok=True)
+                for arc in archives:
+                    print(f"  Extracting {arc}...")
+                    if arc.endswith(".zip"):
+                        import zipfile
+                        with zipfile.ZipFile(arc, 'r') as zf:
+                            zf.extractall(extract_dir)
+                    elif arc.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2")):
+                        import tarfile
+                        with tarfile.open(arc, 'r:*') as tf:
+                            tf.extractall(extract_dir)
+                # 在解压目录中搜索
+                for item in os.listdir(extract_dir):
+                    full = os.path.join(extract_dir, item)
+                    if os.path.isdir(full) and os.path.isdir(os.path.join(full, "cloudy")):
+                        found = full
+                        print(f"  Found after extraction: {found}")
+                        break
+                # 可能多了一层
+                if not found:
+                    for item in os.listdir(extract_dir):
+                        d1 = os.path.join(extract_dir, item)
+                        if os.path.isdir(d1):
+                            for item2 in os.listdir(d1):
+                                d2 = os.path.join(d1, item2)
+                                if os.path.isdir(d2) and os.path.isdir(os.path.join(d2, "cloudy")):
+                                    found = d2
+                                    print(f"  Found (nested): {found}")
+                                    break
+                        if found: break
+            else:
+                print("  No archives found.")
 
         if found:
             data_root = found
