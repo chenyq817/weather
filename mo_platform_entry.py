@@ -92,8 +92,14 @@ class PlatformDataset(Dataset):
         if self.transform: img = self.transform(img)
         return img, self.labels[idx]
 
-# ============ Train ============
-def train(train_dataset, val_dataset=None):
+# ============ Train (默认: 加载预训练权重微调) ============
+def train(train_dataset, val_dataset=None,
+          pretrained_path="output/best_model_v10_convnext_s456.pth"):
+    """默认使用天气预训练权重在新数据上微调 (更快收敛, 更好泛化)"""
+    return train_with_pretrained(train_dataset, val_dataset, pretrained_path)
+
+def train_from_scratch(train_dataset, val_dataset=None):
+    """从ImageNet从头训练 (不使用天气预训练)"""
     train_loader = DataLoader(train_dataset, BATCH_SIZE, shuffle=True,
                                num_workers=2, pin_memory=True, drop_last=True)
     val_loader = None
@@ -101,11 +107,10 @@ def train(train_dataset, val_dataset=None):
         val_loader = DataLoader(val_dataset, BATCH_SIZE, shuffle=False,
                                  num_workers=2, pin_memory=True)
 
-    model = build_model()
+    model = build_model()  # ImageNet init
     criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
     scaler = torch.amp.GradScaler() if USE_AMP else None
 
-    # Warmup: freeze backbone
     for n, p in model.named_parameters(): p.requires_grad = "classifier" in n
     opt = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=LR, weight_decay=WD)
     sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=NUM_EPOCHS, eta_min=1e-6)
