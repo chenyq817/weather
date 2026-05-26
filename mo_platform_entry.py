@@ -20,6 +20,8 @@ LABEL_SMOOTH = 0.1; MIXUP_A = 0.3; CUTMIX_A = 0.2; MIXUP_P = 0.7
 GRAD_CLIP = 1.0
 NUM_CLASSES = 4
 CLASS_NAMES = ["cloudy", "rain", "sunny", "snow"]
+CLASS_MAP = {"cloudy": "cloudy", "rainy": "rain", "sunny": "sunny", "snow": "snow"}
+TRAIN_CLASSES = ["cloudy", "rain", "sunny", "snow"]
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 USE_AMP = torch.cuda.is_available()
 
@@ -256,3 +258,80 @@ def predict(test_dataset, model_path="best_model.pth"):
                 prob = tta_predict(images[i].cpu().numpy() if torch.is_tensor(images[i]) else images[i])
                 all_preds.append(prob.argmax().item())
     return all_preds
+
+# ============ Self-executing main (MO平台直接运行此脚本) ============
+if __name__ == "__main__":
+    print("=" * 50)
+    print("MO Platform Training - ConvNeXt-Tiny")
+    print(f"Device: {DEVICE} | Classes: {CLASS_NAMES}")
+    print("=" * 50)
+
+    # 尝试从环境变量获取数据路径
+    data_root = os.environ.get("DATA_DIR") or os.environ.get("DATASET_DIR") or ""
+
+    # 如果环境变量没设置, 搜索常见路径
+    if not data_root or not os.path.isdir(data_root):
+        candidates = [
+            "-d/weather_classification",
+            "/home/jovyan/data/weather_classification",
+            "/home/jovyan/-d/weather_classification",
+            "/data/weather_classification",
+            "/dataset/weather_classification",
+        ]
+        for c in candidates:
+            if os.path.isdir(os.path.join(c, "cloudy")):
+                data_root = c
+                break
+
+    if not data_root:
+        print("ERROR: Cannot find dataset. Set DATA_DIR env var or mount dataset.")
+        print("Checking what's available:")
+        for d in ["/", "/home/jovyan", "/home/jovyan/data", "/data", "/dataset", "-d", "."]:
+            if os.path.isdir(d):
+                print(f"  {d}/: {os.listdir(d)[:10]}")
+        sys.exit(1)
+
+    print(f"Data root: {data_root}")
+
+    # 读取数据: 用 ImageFolder 方式
+    from torchvision.datasets import ImageFolder
+    full_train = ImageFolder(data_root, transform=train_transform)
+
+    # 只保留4类
+    keep_indices = [i for i, (_, label) in enumerate(full_train.samples)
+                    if full_train.classes[label] in CLASS_MAP]
+    # 重映射标签
+    class_to_idx_new = {cls: i for i, cls in enumerate(TRAIN_CLASSES)}
+    samples = []
+    for i in keep_indices:
+        path, label = full_train.samples[i]
+        cls_name = full_train.classes[label]
+        if cls_name in CLASS_MAP:
+            samples.append((path, class_to_idx_new[CLASS_MAP[cls_name]]))
+
+    # 划分 train/val
+    from sklearn.model_selection import train_test_split
+    train_samples, val_samples = train_test_split(
+        samples, test_size=0.15, stratify=[s[1] for s in samples], random_state=42)
+
+    print(f"Total samples (4 classes): {len(samples)}")
+    print(f"Train: {len(train_samples)}, Val: {len(val_samples)}")
+
+    # 包装成Dataset
+    class SimpleDS(Dataset):
+        def __init__(self, samples, transform):
+            self.samples = samples; self.tf = transform
+        def __len__(self): return len(self.samples)
+        def __getitem__(self, idx):
+            p, l = self.samples[idx]
+            img = Image.open(p).convert("RGB")
+            if self.tf: img = self.tf(img)
+            return img, l
+
+    train_ds = SimpleDS(train_samples, train_transform)
+    val_ds = SimpleDS(val_samples, val_transform)
+
+    # 训练
+    print("\nStarting training...")
+    model = train(train_ds, val_ds)
+    print("Training complete. Model saved as best_model.pth")
