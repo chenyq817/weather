@@ -39,28 +39,45 @@ print(f"Pretrained: {PRETRAINED_MODEL}")
 
 # ============ 数据准备 ============
 def auto_detect_data_dir():
-    """自动探测MO平台数据路径"""
+    """自动探测MO平台数据路径 — 广度搜索"""
+    # 先试常见路径
     candidates = [
         "-d/weather_classification",
         "/home/jovyan/data/weather_classification",
         "/home/jovyan/-d/weather_classification",
         "/data/weather_classification",
+        "/dataset/weather_classification",
+        "/input/weather_classification",
         "../data/weather_classification",
         "data/weather_classification",
     ]
     for path in candidates:
-        test_dir = os.path.join(path, "cloudy")
-        if os.path.isdir(test_dir):
+        if os.path.isdir(os.path.join(path, "cloudy")):
             return path
-    # 都没找到, 列出可能的目录帮助排查
-    print("Auto-detect failed. Checking filesystem...")
-    for root in ["/home/jovyan", "/home/jovyan/data", "/data", ".", ".."]:
+
+    # 广度搜索: 扫描整个文件系统找包含 cloudy 目录的路径
+    print("Searching filesystem for weather_classification...")
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["find", "/", "-maxdepth", "4", "-type", "d", "-name", "cloudy"],
+            capture_output=True, text=True, timeout=30
+        )
+        for line in result.stdout.strip().split("\n"):
+            if line and "weather" in line.lower():
+                parent = os.path.dirname(line)
+                print(f"  Found: {parent}")
+                return parent
+    except:
+        pass
+
+    # 最后列出关键目录
+    print("Could not find data. Listing key directories:")
+    for root in ["/home/jovyan", "/", "/data", "/dataset", "/input", "."]:
         if os.path.isdir(root):
-            print(f"  {root}/: {os.listdir(root)[:10]}")
-    raise FileNotFoundError(
-        f"Cannot find weather_classification directory. "
-        f"Tried: {candidates}. Set DATA_DIR manually in train_mo.py"
-    )
+            items = os.listdir(root)[:15]
+            print(f"  {root}/: {items}")
+    raise FileNotFoundError("Set DATA_DIR to the correct path in train_mo.py")
 
 def prepare_data(data_dir, train_per_class, test_per_class):
     """从原始6类数据中提取4类, 划分train/test, 复制到临时目录"""
