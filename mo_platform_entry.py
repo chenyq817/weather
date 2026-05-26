@@ -8,6 +8,7 @@ import torch, torch.nn as nn, torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms, models
 from sklearn.metrics import f1_score
+from sklearn.model_selection import train_test_split
 from PIL import Image
 
 # ============ Config ============
@@ -310,7 +311,6 @@ if __name__ == "__main__":
             samples.append((path, class_to_idx_new[CLASS_MAP[cls_name]]))
 
     # 划分 train/val
-    from sklearn.model_selection import train_test_split
     train_samples, val_samples = train_test_split(
         samples, test_size=0.15, stratify=[s[1] for s in samples], random_state=42)
 
