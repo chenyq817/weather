@@ -261,5 +261,63 @@ def predict(test_dataset, model_path="best_model.pth"):
     return all_preds
 
 # ============ Module loaded ============
-print(f"[mo_platform_entry] Loaded. Device={DEVICE} Classes={CLASS_NAMES} Backbone=ConvNeXt-Tiny")
-print(f"[mo_platform_entry] Waiting for platform to call train(train_dataset, val_dataset)...")
+if __name__ == "__main__":
+    print("=" * 50)
+    print("MO Platform Training - ConvNeXt-Tiny")
+    print(f"Device: {DEVICE} | Classes: {CLASS_NAMES}")
+    print("=" * 50)
+
+    # 从命令行参数获取数据路径: python mo_platform_entry.py <data_dir>
+    if len(sys.argv) > 1:
+        data_root = sys.argv[1]
+    else:
+        data_root = os.environ.get("DATA_DIR", "")
+
+    if not data_root or not os.path.isdir(data_root):
+        print(f"ERROR: Data path '{data_root}' not found.")
+        print("Usage: python mo_platform_entry.py <data_directory>")
+        print("Example: python mo_platform_entry.py -d/weather_classification")
+        print("\nListing filesystem for reference:")
+        for d in ["/home/jovyan", "/home/jovyan/data", "-d", "/data", "/dataset", "."]:
+            if os.path.isdir(d):
+                print(f"  {d}/: {os.listdir(d)[:15]}")
+        sys.exit(1)
+
+    print(f"Data root: {data_root}")
+
+    # 用ImageFolder读取, 过滤4类
+    from torchvision.datasets import ImageFolder
+    full_train = ImageFolder(data_root, transform=train_transform)
+
+    # 只保留4类, 重映射标签
+    class_to_idx_new = {cls: i for i, cls in enumerate(TRAIN_CLASSES)}
+    samples = []
+    for path, label in full_train.samples:
+        cls_name = full_train.classes[label]
+        if cls_name in CLASS_MAP:
+            samples.append((path, class_to_idx_new[CLASS_MAP[cls_name]]))
+    print(f"Loaded {len(samples)} samples ({len(set(s[1] for s in samples))} classes)")
+    for cls in TRAIN_CLASSES:
+        print(f"  {cls}: {sum(1 for s in samples if s[1]==TRAIN_CLASSES.index(cls))}")
+
+    # 划分
+    train_samples, val_samples = train_test_split(
+        samples, test_size=0.15, stratify=[s[1] for s in samples], random_state=42)
+    print(f"Train: {len(train_samples)}, Val: {len(val_samples)}")
+
+    class SimpleDS(Dataset):
+        def __init__(self, s, tf):
+            self.samples = s; self.tf = tf
+        def __len__(self): return len(self.samples)
+        def __getitem__(self, idx):
+            p, l = self.samples[idx]
+            img = Image.open(p).convert("RGB")
+            if self.tf: img = self.tf(img)
+            return img, l
+
+    train_ds = SimpleDS(train_samples, train_transform)
+    val_ds = SimpleDS(val_samples, val_transform)
+
+    print("\nStarting training...")
+    model = train(train_ds, val_ds)
+    print("Training complete. Model saved as best_model.pth")
