@@ -1,192 +1,148 @@
 """
-智海Mo平台部署 - Handler函数
-应用名称: 天气图片分类 (Weather Classification)
-功能: 识别图片中的天气类型 (晴天/雨天/阴天/雪天)
-
-部署时，Mo平台会自动识别 handle 函数的输入输出参数生成 app_spec.yml
+天气分类部署 Handler - ConvNeXt-Tiny 双模型 TTA 集成
+类别: cloudy(阴天) / rain(雨天) / sunny(晴天) / snow(雪天)
 """
-
-import os
-import time
-import base64
-import io
+import os, time, base64, io
 import numpy as np
 from PIL import Image
-import torch
-import torch.nn as nn
+import torch, torch.nn as nn
 from torchvision import transforms, models
 
-# ======== 全局配置 ========
-IMAGE_SIZE = 224
-NUM_CLASSES = 4
-CLASS_NAMES = ["cloudy", "rain", "shine", "sunrise"]
-DEVICE = torch.device("cpu")  # 部署环境可能无GPU，用CPU保证兼容
+IMAGE_SIZE = 260; NUM_CLASSES = 4
+CLASS_NAMES = ["cloudy", "rain", "sunny", "snow"]
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 图片预处理
-_transform = transforms.Compose([
-    transforms.Resize(int(IMAGE_SIZE * 1.14)),
-    transforms.CenterCrop(IMAGE_SIZE),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
+TTA_SIZE = int(IMAGE_SIZE * 1.14)
+to_tensor = transforms.ToTensor()
+norm_t = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-# 全局模型实例 (延迟加载)
-_model = None
-
+# Cache
+_models = None
 
 def build_model():
-    """构建模型（与训练时保持一致）"""
-    model = models.efficientnet_b0(weights=None)
-    in_features = model.classifier[1].in_features
+    model = models.convnext_tiny(weights=None)
+    inf = model.classifier[2].in_features
     model.classifier = nn.Sequential(
-        nn.Dropout(p=0.3, inplace=True),
-        nn.Linear(in_features, NUM_CLASSES),
+        nn.Flatten(1), nn.LayerNorm(inf, eps=1e-6),
+        nn.Dropout(0.4), nn.Linear(inf, 256),
+        nn.GELU(), nn.Dropout(0.25), nn.Linear(256, NUM_CLASSES),
     )
     return model
 
+def load_models(model_paths=None):
+    """加载双模型用于集成推理"""
+    global _models
+    if _models is not None:
+        return _models
 
-def get_model(model_path="best_model.pth"):
-    """单例模式加载模型（避免每次推理都重新加载）"""
-    global _model
-    if _model is None:
-        _model = build_model()
-        if os.path.exists(model_path):
-            ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
-            state_dict = ckpt.get("model_state_dict", ckpt)
-            _model.load_state_dict(state_dict, strict=False)
-        _model.eval()
-    return _model
+    if model_paths is None:
+        model_paths = ["best_model_v10_convnext.pth", "best_model_v10_convnext_s456.pth"]
 
+    _models = []
+    for mp in model_paths:
+        m = build_model()
+        if os.path.exists(mp):
+            ckpt = torch.load(mp, map_location=DEVICE, weights_only=False)
+            m.load_state_dict(ckpt.get("model", ckpt))
+        m.eval().to(DEVICE)
+        _models.append(m)
+    return _models
 
-def preprocess_image(image_input):
-    """
-    预处理输入图片（支持多种输入格式）
+def tta_predict(model, img):
+    img_r = transforms.Resize(TTA_SIZE)(img)
+    crops = transforms.FiveCrop(IMAGE_SIZE)(img_r)
+    probs = []
+    for crop in crops:
+        for flip in [False, True]:
+            c = transforms.RandomHorizontalFlip(p=1.0)(crop) if flip else crop
+            t = norm_t(to_tensor(c)).unsqueeze(0).to(DEVICE)
+            with torch.no_grad():
+                probs.append(torch.softmax(model(t), 1))
+    return torch.cat(probs).mean(0, keepdim=True)
 
-    Args:
-        image_input: 可以是:
-            - 文件路径 (str)
-            - Base64编码的图片字符串 (str)
-            - 二进制数据 (bytes)
-            - PIL Image对象
-    Returns:
-        torch.Tensor: (1, 3, H, W)
-    """
+def preprocess(image_input):
     if isinstance(image_input, str):
-        # 尝试作为文件路径
         if os.path.exists(image_input):
-            image = Image.open(image_input).convert("RGB")
+            img = Image.open(image_input).convert("RGB")
         else:
-            # 尝试作为Base64解码
             try:
-                image_bytes = base64.b64decode(image_input)
-                image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            except Exception:
-                raise ValueError(
-                    f"无法解析image_input: 不是有效的文件路径或Base64字符串"
-                )
+                img = Image.open(io.BytesIO(base64.b64decode(image_input))).convert("RGB")
+            except:
+                raise ValueError("无法解析image_input")
     elif isinstance(image_input, bytes):
-        image = Image.open(io.BytesIO(image_input)).convert("RGB")
+        img = Image.open(io.BytesIO(image_input)).convert("RGB")
     elif isinstance(image_input, Image.Image):
-        image = image_input.convert("RGB")
+        img = image_input.convert("RGB")
     else:
-        raise ValueError(f"不支持的图片输入格式: {type(image_input)}")
+        raise ValueError(f"不支持的类型: {type(image_input)}")
+    return img
 
-    tensor = _transform(image).unsqueeze(0)
-    return tensor, image
-
-
-def handle(image_input, model_path="best_model.pth"):
+def handle(image_input, model_path="best_model_v10_convnext.pth"):
     """
-    天气分类应用的Handle函数 (Mo平台部署入口)
+    天气分类 Handle 函数
 
-    --- 输入参数 ---
-    image_input: str - 待分类的图片，支持以下格式:
-                     (1) 图片文件路径
-                     (2) Base64编码的图片字符串
-                     (3) 二进制图片数据
-    model_path: str  - 模型权重文件路径 (默认: best_model.pth)
-
-    --- 输出 ---
-    dict: {
-        "prediction": str,          - 预测的天气类别
-        "prediction_cn": str,       - 中文天气类别
-        "confidence": float,        - 置信度 (0~1)
-        "probabilities": dict,      - 各类别概率
-        "all_predictions": list,    - 各类别预测详情
-        "inference_time_ms": float, - 推理耗时(毫秒)
-        "image_size": str,          - 输入图片尺寸
-    }
+    输入:
+        image_input: 图片路径 / Base64 / bytes / PIL Image
+        model_path:  模型路径(单模型) 或 模型路径列表(双模型集成)
+    输出:
+        dict: prediction, confidence, probabilities, inference_time_ms
     """
-    start_time = time.time()
+    t0 = time.time()
 
-    # 1. 加载模型
-    model = get_model(model_path)
+    # 预处理
+    img = preprocess(image_input)
 
-    # 2. 预处理
-    tensor, pil_image = preprocess_image(image_input)
+    # 加载模型 - 支持单模型或双模型
+    if isinstance(model_path, list) and len(model_path) == 2:
+        models_list = load_models(model_path)
+        # 双模型集成
+        p1 = tta_predict(models_list[0], img)
+        p2 = tta_predict(models_list[1], img)
+        probs = ((p1 + p2) / 2).cpu().numpy()[0]
+    else:
+        if isinstance(model_path, list):
+            model_path = model_path[0]
+        models_list = load_models([model_path])
+        probs = tta_predict(models_list[0], img).cpu().numpy()[0]
 
-    # 3. 推理
-    with torch.no_grad():
-        output = model(tensor)
-        probs = torch.softmax(output, dim=1).cpu().numpy()[0]
-
-    inference_time = (time.time() - start_time) * 1000
-
-    # 4. 构建结果
     pred_idx = int(np.argmax(probs))
-    cn_map = {
-        "cloudy": "阴天",
-        "rain": "雨天",
-        "shine": "晴天",
-        "sunrise": "日出",
-    }
+    elapsed = (time.time() - t0) * 1000
 
-    all_predictions = []
-    for i, (name, prob) in enumerate(zip(CLASS_NAMES, probs)):
-        all_predictions.append({
-            "class_id": i,
-            "class_name": name,
+    cn_map = {"cloudy": "阴天", "rain": "雨天", "sunny": "晴天", "snow": "雪天"}
+
+    all_preds = []
+    for i, (name, p) in enumerate(zip(CLASS_NAMES, probs)):
+        all_preds.append({
+            "class_id": i, "class_name": name,
             "class_name_cn": cn_map.get(name, name),
-            "probability": round(float(prob), 4),
+            "probability": round(float(p), 4),
             "is_prediction": i == pred_idx,
         })
+    all_preds.sort(key=lambda x: x["probability"], reverse=True)
 
-    # 按概率降序排列
-    all_predictions.sort(key=lambda x: x["probability"], reverse=True)
-
-    result = {
+    return {
         "prediction": CLASS_NAMES[pred_idx],
         "prediction_cn": cn_map.get(CLASS_NAMES[pred_idx], CLASS_NAMES[pred_idx]),
         "confidence": round(float(probs[pred_idx]), 4),
-        "probabilities": {
-            name: round(float(p), 4)
-            for name, p in zip(CLASS_NAMES, probs)
-        },
-        "all_predictions": all_predictions,
-        "inference_time_ms": round(inference_time, 2),
-        "image_size": f"{pil_image.size[0]}x{pil_image.size[1]}",
+        "probabilities": {name: round(float(p), 4) for name, p in zip(CLASS_NAMES, probs)},
+        "all_predictions": all_preds,
+        "inference_time_ms": round(elapsed, 2),
+        "image_size": f"{img.size[0]}x{img.size[1]}",
     }
 
-    return result
 
-
-# ======== 本地测试 ========
 if __name__ == "__main__":
-    print("天气分类应用 Handler 已就绪")
-    print(f"支持的四类天气: {CLASS_NAMES}")
-    print(f"模型路径: best_model.pth")
+    print(f"天气分类 Handler (ConvNeXt-Tiny + TTA) 已就绪")
+    print(f"Device: {DEVICE} | Classes: {CLASS_NAMES}")
+    print(f"双模型集成: best_model_v10_convnext.pth + best_model_v10_convnext_s456.pth")
 
-    # 如果有测试图片
     test_img = "test_sample.jpg"
     if os.path.exists(test_img):
         result = handle(test_img)
-        print(f"\n测试结果:")
-        print(f"  预测: {result['prediction']} ({result['prediction_cn']})")
-        print(f"  置信度: {result['confidence']:.2%}")
-        print(f"  推理时间: {result['inference_time_ms']}ms")
-        print(f"  各类概率:")
+        print(f"\n预测: {result['prediction_cn']} (置信度: {result['confidence']:.2%})")
         for p in result["all_predictions"]:
             marker = " <--" if p["is_prediction"] else ""
-            print(f"    {p['class_name_cn']}: {p['probability']:.2%}{marker}")
+            print(f"  {p['class_name_cn']}: {p['probability']:.2%}{marker}")
+        print(f"推理耗时: {result['inference_time_ms']}ms")
     else:
-        print(f"提示: 将测试图片放到当前目录作为 {test_img} 可进行测试")
+        print(f"提示: 放一张测试图作为 {test_img} 可测试")

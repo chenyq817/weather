@@ -1,7 +1,8 @@
 data/
-output/
+output/*
+!output/best_model_v10_convnext.pth
+!output/best_model_v10_convnext_s456.pth
 __pycache__/
-*.pth
 *.log
 *.jpg
 *.jpeg

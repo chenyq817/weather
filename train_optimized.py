@@ -1,34 +1,40 @@
 """
-本地训练+测试脚本 (Kaggle MWD小数据集优化版)
-四类天气识别: cloudy, rain, shine, sunrise
-数据集: 1125张 (cloudy=300, rain=215, shine=253, sunrise=357)
-策略: 强增强 + 强正则化 + MixUp/CutMix + CosWarmRestarts
+优化训练脚本: CLAHE预处理 + CBAM注意力 + HSV饱和度分支
+针对阴天(cloudy)分类优化
+
+优化点:
+  1. CLAHE自适应直方图均衡化: 增强阴天图片局部对比度
+  2. CBAM注意力: 通道+空间双注意力, 聚焦判别区域
+  3. HSV分支: 利用阴天S(饱和度)<30的关键特征区间
 """
 
 import os
 import sys
 import time
 import datetime
+import random
 import numpy as np
 from PIL import Image
+import cv2
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, models
+from torchvision import transforms
 from sklearn.metrics import f1_score, accuracy_score, classification_report, confusion_matrix
+
+from model_optimized import OptimizedWeatherModel, count_parameters
 
 # ============ 路径配置 ============
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data", "weather800")  # 800/类混合数据集
+DATA_DIR = os.path.join(BASE_DIR, "data", "weather_clean")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# 日志文件
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-LOG_FILE = os.path.join(LOG_DIR, f"training_{timestamp}.log")
+LOG_FILE = os.path.join(LOG_DIR, f"training_optimized_{timestamp}.log")
 
 
 class Logger:
@@ -49,41 +55,62 @@ class Logger:
 sys.stdout = Logger(LOG_FILE)
 print(f"日志: {LOG_FILE}")
 
-# ============ 超参数 (小数据集优化) ============
-# MWD只有1125张图，必须强增强+强正则化
+# ============ 超参数 (与baseline一致, 公平对比) ============
 IMAGE_SIZE = 224
-BATCH_SIZE = 16              # 更小的batch适应小数据
-NUM_EPOCHS = 30              # shine/sunrise难分，多跑几轮
+BATCH_SIZE = 16
+NUM_EPOCHS = 30
 WARMUP_EPOCHS = 3
 LEARNING_RATE = 1e-3
-FINE_TUNE_LR = 5e-5          # backbone用更小的lr防过拟合
-WEIGHT_DECAY = 3e-4          # 加大权重衰减
-LABEL_SMOOTHING = 0.15       # 更强的标签平滑
-MIXUP_ALPHA = 0.4            # 更强的mixup
-CUTMIX_ALPHA = 0.3           # 更强的cutmix
-MIXUP_PROB = 0.8             # 80%概率触发增强(小数据必须)
+FINE_TUNE_LR = 5e-5
+WEIGHT_DECAY = 3e-4
+LABEL_SMOOTHING = 0.15
+MIXUP_ALPHA = 0.4
+CUTMIX_ALPHA = 0.3
+MIXUP_PROB = 0.8
 GRAD_CLIP = 1.0
-DROPOUT1 = 0.5               # 分类头dropout加大
-DROPOUT2 = 0.3
-CLASS_NAMES = ["cloudy", "rain", "shine", "sunrise"]
+DROPOUT = 0.5
+CLASS_NAMES = ["cloudy", "rain", "sunny", "snow"]
 NUM_CLASSES = len(CLASS_NAMES)
 DEVICE = torch.device("cpu")
 
 print(f"Device: {DEVICE}")
 print(f"Classes: {CLASS_NAMES}")
 print(f"Epochs: {NUM_EPOCHS} | Warmup: {WARMUP_EPOCHS} | Batch: {BATCH_SIZE}")
-print(f"MixUp alpha={MIXUP_ALPHA} | CutMix alpha={CUTMIX_ALPHA}")
+print(f"MixUp alpha={MIXUP_ALPHA} | CutMix alpha={CUTMIX_ALPHA} | MixProb={MIXUP_PROB}")
 print(f"LabelSmoothing={LABEL_SMOOTHING} | WeightDecay={WEIGHT_DECAY}")
+print(f"优化: CLAHE + CBAM + HSV")
 
-# ============ 数据增强 (小数据集强化版) ============
+# ============ CLAHE 预处理 ============
+class CLAHEEnhance:
+    """CLAHE自适应直方图均衡化 — LAB色彩空间L通道增强
+    概率性应用(prob=0.6), 让模型见过增强和未增强两种图片
+    """
+    def __init__(self, clip_limit=2.0, tile_grid_size=(8, 8), prob=0.6):
+        self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+        self.prob = prob
+
+    def __call__(self, img):
+        if random.random() < self.prob:
+            img_np = np.array(img)
+            lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
+            l, a, b = cv2.split(lab)
+            l = self.clahe.apply(l)
+            lab = cv2.merge([l, a, b])
+            img_np = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+            return Image.fromarray(img_np)
+        return img
+
+
+# ============ 数据增强管线 ============
 train_transform = transforms.Compose([
+    CLAHEEnhance(clip_limit=2.0, tile_grid_size=(8, 8), prob=0.6),
     transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.6, 1.0)),
     transforms.RandomHorizontalFlip(p=0.5),
     transforms.RandomVerticalFlip(p=0.15),
     transforms.RandomRotation(30),
     transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.15),
     transforms.RandomGrayscale(p=0.1),
-    transforms.TrivialAugmentWide(),       # ★ 自动增强(小数据神器)
+    transforms.TrivialAugmentWide(),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     transforms.RandomErasing(p=0.35),
@@ -128,14 +155,13 @@ class WeatherDataset(Dataset):
 
 
 # ============ 加载数据 ============
-print("\n=== 加载数据 (weather800) ===")
-_TRAIN_DIR = os.path.join(DATA_DIR, "train")
-_TEST_DIR = os.path.join(DATA_DIR, "test")
+print("\n=== 加载数据 (weather_clean) ===")
+TRAIN_DIR = os.path.join(DATA_DIR, "train")
+TEST_DIR = os.path.join(DATA_DIR, "test")
 
-full_train = WeatherDataset(_TRAIN_DIR, transform=train_transform)
-test_dataset = WeatherDataset(_TEST_DIR, transform=val_transform)
+full_train = WeatherDataset(TRAIN_DIR, transform=train_transform)
+test_dataset = WeatherDataset(TEST_DIR, transform=val_transform)
 
-# 统计类别分布
 class_counts = {}
 for _, label in full_train.samples:
     cls = CLASS_NAMES[label]
@@ -143,46 +169,36 @@ for _, label in full_train.samples:
 print(f"训练集: {len(full_train)} 张")
 for cls in CLASS_NAMES:
     print(f"  {cls}: {class_counts.get(cls, 0)} 张")
+print(f"测试集: {len(test_dataset)} 张")
 
-# 从训练集切分15%为验证集
+# 切分验证集
 from torch.utils.data import random_split
 val_size = max(1, int(0.15 * len(full_train)))
 train_size = len(full_train) - val_size
-train_dataset, val_dataset = random_split(
+train_dataset, _ = random_split(
     full_train, [train_size, val_size],
     generator=torch.Generator().manual_seed(42),
 )
-# 验证集改transform
-full_for_val = WeatherDataset(_TRAIN_DIR, transform=val_transform)
+full_for_val = WeatherDataset(TRAIN_DIR, transform=val_transform)
 _, val_dataset = random_split(
     full_for_val, [train_size, val_size],
     generator=torch.Generator().manual_seed(42),
 )
-
 print(f"切分: train={train_size}, val={val_size}, test={len(test_dataset)}")
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                           num_workers=0, drop_last=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-                        num_workers=0)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
-                         num_workers=0)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
 # ============ 模型 ============
-print("\n=== 构建模型 ===")
-model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
-in_features = model.classifier[1].in_features
-model.classifier = nn.Sequential(
-    nn.Dropout(p=DROPOUT1),
-    nn.Linear(in_features, 256),
-    nn.BatchNorm1d(256),        # ★ 加BN稳定小数据训练
-    nn.ReLU(),
-    nn.Dropout(p=DROPOUT2),
-    nn.Linear(256, NUM_CLASSES),
-)
+print("\n=== 构建优化模型 ===")
+model = OptimizedWeatherModel(num_classes=NUM_CLASSES, dropout=DROPOUT, hsv_dim=64)
 model = model.to(DEVICE)
-total_p = sum(p.numel() for p in model.parameters()) / 1e6
-print(f"EfficientNet-B0: {total_p:.2f}M params (增强分类头: 1280→256→4)")
+total_p, trainable_p = count_parameters(model)
+print(f"OptimizedModel: {total_p/1e6:.2f}M params ({trainable_p/1e6:.2f}M trainable)")
+print(f"  Backbone: EfficientNet-B0 + CBAM + HSV({64}d)")
+print(f"  分类头: (1280+64)→256→{NUM_CLASSES}")
 
 
 # ============ MixUp / CutMix ============
@@ -222,9 +238,12 @@ def cutmix_data(x, y, alpha=0.2):
 print("\n=== 开始训练 ===")
 criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
-# Phase 1: 冻结backbone
+# Phase 1: 冻结backbone, 只训分类头和HSV分支
 for name, param in model.named_parameters():
-    param.requires_grad = "classifier" in name
+    if "features" in name or "cbam" in name:
+        param.requires_grad = False
+    else:
+        param.requires_grad = True
 
 optimizer = optim.AdamW(
     filter(lambda p: p.requires_grad, model.parameters()),
@@ -233,25 +252,28 @@ optimizer = optim.AdamW(
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
 
 best_f1 = 0.0
-best_ckpt = os.path.join(OUTPUT_DIR, "best_model_w800.pth")
-history = {"train_loss": [], "val_loss": [], "val_acc": [], "val_f1": []}
+best_ckpt = os.path.join(OUTPUT_DIR, "best_model_optimized.pth")
 start_time = time.time()
 
 for epoch in range(NUM_EPOCHS):
-    # Phase 2: 解冻backbone
+    # Phase 2: 解冻全部
     if epoch == WARMUP_EPOCHS:
-        print(f"\n>>> Epoch {epoch+1}: 解冻backbone，全模型微调")
+        print(f"\n>>> Epoch {epoch+1}: 解冻全部参数，全模型微调")
         for param in model.parameters():
             param.requires_grad = True
-        head_params = [p for n, p in model.named_parameters()
-                       if "classifier" in n and p.requires_grad]
-        backbone_params = [p for n, p in model.named_parameters()
-                           if "classifier" not in n and p.requires_grad]
+        head_params = []
+        backbone_params = []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "features" in n or "cbam" in n:
+                backbone_params.append(p)
+            else:
+                head_params.append(p)
         optimizer = optim.AdamW([
             {"params": head_params, "lr": LEARNING_RATE},
             {"params": backbone_params, "lr": FINE_TUNE_LR},
         ], weight_decay=WEIGHT_DECAY)
-        # CosineWarmRestarts: 周期性重启，更好跳出局部最优
         scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=4, T_mult=2, eta_min=1e-6,
         )
@@ -263,7 +285,6 @@ for epoch in range(NUM_EPOCHS):
     for images, targets in train_loader:
         images, targets = images.to(DEVICE), targets.to(DEVICE)
 
-        # 混合增强策略
         if epoch >= WARMUP_EPOCHS and torch.rand(1).item() < MIXUP_PROB:
             if torch.rand(1).item() < 0.6:
                 images, targets_a, targets_b, lam = mixup_data(images, targets, MIXUP_ALPHA)
@@ -308,11 +329,6 @@ for epoch in range(NUM_EPOCHS):
     val_acc = accuracy_score(val_targets, val_preds)
     val_f1 = f1_score(val_targets, val_preds, average="macro")
 
-    history["train_loss"].append(avg_train_loss)
-    history["val_loss"].append(avg_val_loss)
-    history["val_acc"].append(val_acc)
-    history["val_f1"].append(val_f1)
-
     phase = "WARM" if epoch < WARMUP_EPOCHS else "FT  "
     lr = optimizer.param_groups[0]['lr']
     print(f"{phase} Epoch {epoch+1:3d}/{NUM_EPOCHS} | "
@@ -340,7 +356,9 @@ print(f"\n训练完成! 耗时: {elapsed/60:.1f} 分钟")
 print(f"最佳验证F1: {best_f1:.4f} -> 比赛得分: {best_f1*100:.1f}")
 
 # ============ 测试集评估 ============
-print("\n=== 测试集评估 ===")
+print("\n" + "=" * 60)
+print("=== 测试集评估 ===")
+print("=" * 60)
 ckpt = torch.load(best_ckpt, map_location=DEVICE, weights_only=False)
 model.load_state_dict(ckpt["model_state_dict"])
 model.eval()
@@ -361,7 +379,7 @@ test_acc = accuracy_score(test_targets, test_preds)
 test_f1_macro = f1_score(test_targets, test_preds, average="macro")
 test_f1_weighted = f1_score(test_targets, test_preds, average="weighted")
 
-print(f"\n测试集结果 ({len(test_dataset)} images):")
+print(f"\n测试集结果 ({len(test_dataset)} 张):")
 print(f"  Accuracy:       {test_acc:.4f}")
 print(f"  F1 (macro):     {test_f1_macro:.4f}")
 print(f"  F1 (weighted):  {test_f1_weighted:.4f}")
@@ -380,20 +398,25 @@ print(header)
 for i, name in enumerate(CLASS_NAMES):
     print(f"  {name:8s}" + " ".join(f"{cm[i][j]:8d}" for j in range(len(CLASS_NAMES))))
 
-# ============ 每类推理速度 ============
-print("\n推理速度 (每类10张):")
-for cls_name in CLASS_NAMES:
-    cls_dir = os.path.join(TEST_DIR, cls_name)
-    imgs = sorted(os.listdir(cls_dir))[:10]
-    times = []
-    for fname in imgs:
-        image = Image.open(os.path.join(cls_dir, fname)).convert("RGB")
-        tensor = val_transform(image).unsqueeze(0).to(DEVICE)
-        t0 = time.time()
-        with torch.no_grad():
-            _ = model(tensor)
-        times.append((time.time() - t0) * 1000)
-    print(f"  {cls_name}: avg={np.mean(times):.2f}ms")
+print("\n各类别F1:")
+per_class_f1 = f1_score(test_targets, test_preds, average=None)
+for i, cls in enumerate(CLASS_NAMES):
+    print(f"  {cls}: {per_class_f1[i]:.4f}")
+
+# ============ 与 Baseline 对比 ============
+print("\n" + "=" * 60)
+print("=== 优化前后对比 ===")
+print("=" * 60)
+baseline = {"cloudy": 0.6801, "rain": 0.8550, "sunny": 0.7740, "snow": 0.9147, "macro": 0.8060}
+print(f"{'类别':<12} {'Baseline':<12} {'优化后':<12} {'变化':<12}")
+print("-" * 48)
+for i, cls in enumerate(CLASS_NAMES):
+    diff = per_class_f1[i] - baseline[cls]
+    sign = "+" if diff > 0 else ""
+    print(f"  {cls:<10} {baseline[cls]:.4f}       {per_class_f1[i]:.4f}       {sign}{diff:.4f}")
+diff_macro = test_f1_macro - baseline["macro"]
+sign = "+" if diff_macro > 0 else ""
+print(f"  {'macro avg':<10} {baseline['macro']:.4f}       {test_f1_macro:.4f}       {sign}{diff_macro:.4f}")
 
 print(f"\n=== 全部完成 ===")
 print(f"模型: {best_ckpt}")

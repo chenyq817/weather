@@ -1,54 +1,26 @@
-# 天气图片分类 - 智海算法调优
+# Weather Classification
 
-四类天气识别：cloudy(阴天) / rain(雨天) / shine(晴天) / sunrise(日出)
+四类天气识别：cloudy(阴天) / rain(雨天) / sunny(晴天) / snow(雪天)
 
-数据集: Kaggle [Multi-class Weather Dataset (MWD)](https://www.kaggle.com/datasets/saurabhshahane/multi-class-weather-dataset)
+## Best Model
 
-## Kaggle MWD → Mo平台 部署步骤
+**ConvNeXt-Tiny + TTA + 2-Model Ensemble: 88.46% Macro F1**
 
-### 1. 下载数据集
+| Model | Backbone | Macro F1 | Notes |
+|-------|----------|---------|-------|
+| v10 | ConvNeXt-Tiny | 87.91% | Single model s456 |
+| v10 Ensemble | ConvNeXt-Tiny x2 | 88.46% | s42 + s456 + threshold |
 
-访问 https://www.kaggle.com/datasets/saurabhshahane/multi-class-weather-dataset
-点击 Download 下载 archive.zip（约30MB，1125张图片）
+## Quick Start
 
-### 2. 上传到Mo平台
+```python
+from handler import handle
+result = handle("image.jpg", model_path="output/best_model_v10_convnext_s456.pth")
+print(result["prediction_cn"])  # 阴天/雨天/晴天/雪天
+```
 
-登录Mo平台 → 新建项目 → 上传文件：
-- `coding_here.ipynb`
-- `archive.zip`（Kaggle下载的数据集）
-
-### 3. 运行Notebook
-
-在Mo平台打开 `coding_here.ipynb`，按顺序运行每个Cell：
-
-| Cell | 作用 |
-|------|------|
-| Step 0 | 安装依赖 |
-| 解压Cell | 解压 archive.zip |
-| Step 1 | 配置参数（GPU环境自动检测） |
-| Step 2 | 数据增强管线 |
-| Step 3 | 自动查找并加载数据 |
-| Step 4-7 | 构建模型 + 训练函数 |
-| Step 8 | 开始训练（GPU建议60轮） |
-| Step 9-10 | 推理测试 + Handle函数 |
-
-### 4. 部署应用
-
-- 左侧栏 → 部署图标
-- 选中 Step 10 的 handle 函数 → 插入
-- 勾选依赖Cell + best_model.pth
-- 发布正式版本
-
-### 5. 测试
-
-部署后在详情页点"测试项目"，上传天气图片验证分类结果。
-
-## 本地开发
+## Training
 
 ```bash
-# 安装依赖
-pip install -r requirements.txt
-
-# 本地训练（需要先下载Kaggle数据集到 data/ 目录）
-python train_local.py
+python train_v10_convnext.py
 ```

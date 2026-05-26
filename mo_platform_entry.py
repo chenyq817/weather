@@ -1,268 +1,179 @@
 """
-智海Mo平台适配入口
-根据平台提供的API接口编写
-
-常见平台接口模式:
-  1. 平台提供 train_dataset, val_dataset, test_dataset 对象
-  2. 平台提供 DataLoader 或直接调用 train() / predict() 函数
-  3. 平台通过命令行参数传入数据路径
+智海Mo平台训练入口 - ConvNeXt-Tiny + v8增强策略
+适配平台标准 train(train_dataset, val_dataset) / predict(test_dataset) 接口
 """
-
-import os
-import sys
+import os, sys, random
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import torch, torch.nn as nn, torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-from torch.cuda.amp import GradScaler, autocast
-from torchvision import transforms
-from PIL import Image
+from torchvision import transforms, models
 from sklearn.metrics import f1_score
+from PIL import Image
 
-# ============================================================
-# 智海Mo平台标准接口
-# 请根据实际比赛平台提供的模板调整
-# ============================================================
-
-# ---- 配置 ----
-IMAGE_SIZE = 224
-BATCH_SIZE = 64
-NUM_EPOCHS = 60
-LEARNING_RATE = 1e-3
-FINE_TUNE_LR = 1e-4
+# ============ Config ============
+IMAGE_SIZE = 260
+BATCH_SIZE = 32
+NUM_EPOCHS = 40
+WARMUP_EPOCHS = 3
+LR = 8e-4; FINE_LR = 3e-5; WD = 3e-4
+LABEL_SMOOTH = 0.1; MIXUP_A = 0.3; CUTMIX_A = 0.2; MIXUP_P = 0.7
+GRAD_CLIP = 1.0
 NUM_CLASSES = 4
-CLASS_NAMES = ["cloudy", "rain", "shine", "sunrise"]
+CLASS_NAMES = ["cloudy", "rain", "sunny", "snow"]
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_AMP = torch.cuda.is_available()
 
-# ---- 数据增强 ----
 train_transform = transforms.Compose([
-    transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.8, 1.0)),
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomRotation(20),
-    transforms.ColorJitter(0.3, 0.3, 0.3, 0.1),
+    transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.7, 1.0)),
+    transforms.RandomHorizontalFlip(p=0.5), transforms.RandomVerticalFlip(p=0.1),
+    transforms.RandomRotation(15), transforms.ColorJitter(0.2, 0.2, 0.2, 0.05),
+    transforms.RandomAdjustSharpness(sharpness_factor=2, p=0.3),
+    transforms.RandomEqualize(p=0.1), transforms.RandomGrayscale(p=0.05),
+    transforms.RandAugment(num_ops=2, magnitude=7),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)),
 ])
 
 val_transform = transforms.Compose([
-    transforms.Resize(int(IMAGE_SIZE * 1.14)),
-    transforms.CenterCrop(IMAGE_SIZE),
+    transforms.Resize(int(IMAGE_SIZE * 1.14)), transforms.CenterCrop(IMAGE_SIZE),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
+# ============ MixUp / CutMix ============
+def mixup_data(x, y, alpha):
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    idx = torch.randperm(x.size(0), device=x.device)
+    return lam*x + (1-lam)*x[idx], y, y[idx], lam
 
-class PlatformDataset(Dataset):
-    """适配智海Mo平台的数据集包装器"""
+def cutmix_data(x, y, alpha):
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    B, _, H, W = x.size(); idx = torch.randperm(B, device=x.device)
+    cx, cy = np.random.randint(W), np.random.randint(H)
+    bw = int(W * np.sqrt(1-lam)); bh = int(H * np.sqrt(1-lam))
+    x0, y0 = np.clip(cx-bw//2, 0, W), np.clip(cy-bh//2, 0, H)
+    x1, y1 = np.clip(cx+bw//2, 0, W), np.clip(cy+bh//2, 0, H)
+    mx = x.clone(); mx[:,:,y0:y1,x0:x1] = x[idx,:,y0:y1,x0:x1]
+    return mx, y, y[idx], 1 - (x1-x0)*(y1-y0)/(H*W)
 
-    def __init__(self, images, labels, transform=None):
-        """
-        Args:
-            images: numpy array or list of PIL Images
-            labels: numpy array or list of int
-            transform: torchvision transforms
-        """
-        self.images = images
-        self.labels = labels
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-        img = self.images[idx]
-        label = self.labels[idx]
-
-        # 如果是 numpy array, 转为 PIL Image
-        if isinstance(img, np.ndarray):
-            img = Image.fromarray(img)
-        elif not isinstance(img, Image.Image):
-            img = Image.open(img).convert("RGB") if isinstance(img, str) else img
-
-        if self.transform:
-            img = self.transform(img)
-
-        return img, label
-
-
+# ============ Model ============
 def build_model():
-    """构建 EfficientNet-B0 模型"""
-    import torchvision.models as models
-    model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
-    in_features = model.classifier[1].in_features
+    model = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+    inf = model.classifier[2].in_features  # 768
     model.classifier = nn.Sequential(
-        nn.Dropout(p=0.3, inplace=True),
-        nn.Linear(in_features, NUM_CLASSES),
+        nn.Flatten(1), nn.LayerNorm(inf, eps=1e-6),
+        nn.Dropout(0.4), nn.Linear(inf, 256),
+        nn.GELU(), nn.Dropout(0.25), nn.Linear(256, NUM_CLASSES),
     )
     return model.to(DEVICE)
 
+# ============ Dataset wrapper ============
+class PlatformDataset(Dataset):
+    def __init__(self, images, labels, transform=None):
+        self.images = images; self.labels = labels; self.transform = transform
+    def __len__(self): return len(self.images)
+    def __getitem__(self, idx):
+        img = self.images[idx]
+        if isinstance(img, str): img = Image.open(img).convert("RGB")
+        elif isinstance(img, np.ndarray): img = Image.fromarray(img)
+        if self.transform: img = self.transform(img)
+        return img, self.labels[idx]
 
-# ============================================================
-# 平台标准训练函数 (可能被平台自动调用)
-# ============================================================
-
+# ============ Train ============
 def train(train_dataset, val_dataset=None):
-    """
-    智海Mo平台训练接口
-
-    Args:
-        train_dataset: 平台提供的训练数据集
-        val_dataset: 平台提供的验证数据集 (可能为None)
-    Returns:
-        model: 训练好的模型
-    """
-    # 包装数据
-    if hasattr(train_dataset, '__getitem__'):
-        train_loader = DataLoader(
-            train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-            num_workers=2, pin_memory=True, drop_last=True,
-        )
-    else:
-        raise ValueError("train_dataset 格式不支持")
-
+    train_loader = DataLoader(train_dataset, BATCH_SIZE, shuffle=True,
+                               num_workers=2, pin_memory=True, drop_last=True)
     val_loader = None
-    if val_dataset is not None and hasattr(val_dataset, '__getitem__'):
-        val_loader = DataLoader(
-            val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-            num_workers=2, pin_memory=True,
-        )
+    if val_dataset is not None:
+        val_loader = DataLoader(val_dataset, BATCH_SIZE, shuffle=False,
+                                 num_workers=2, pin_memory=True)
 
-    # 构建模型
     model = build_model()
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
+    scaler = torch.amp.GradScaler() if USE_AMP else None
 
-    # 损失函数 (Label Smoothing)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-
-    # 训练
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
-    scaler = GradScaler(enabled=torch.cuda.is_available())
+    # Warmup: freeze backbone
+    for n, p in model.named_parameters(): p.requires_grad = "classifier" in n
+    opt = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=LR, weight_decay=WD)
+    sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=NUM_EPOCHS, eta_min=1e-6)
 
     best_f1 = 0.0
+    for ep in range(NUM_EPOCHS):
+        if ep == WARMUP_EPOCHS:
+            print(f"E{ep+1}: Unfreeze backbone")
+            for p in model.parameters(): p.requires_grad = True
+            hp = [p for n,p in model.named_parameters() if "classifier" in n]
+            bp = [p for n,p in model.named_parameters() if "classifier" not in n]
+            opt = optim.AdamW([{"params":hp,"lr":LR},{"params":bp,"lr":FINE_LR}], weight_decay=WD)
+            sch = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=5, T_mult=2, eta_min=1e-6)
 
-    for epoch in range(NUM_EPOCHS):
-        # ---- Train ----
-        model.train()
-        train_loss = 0.0
+        model.train(); tl_ = 0.0
+        for x, y in train_loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            ma = ep >= WARMUP_EPOCHS and torch.rand(1).item() < MIXUP_P
+            if ma:
+                if torch.rand(1).item() < 0.6: x, ya, yb, lam = mixup_data(x, y, MIXUP_A)
+                else: x, ya, yb, lam = cutmix_data(x, y, CUTMIX_A)
+            opt.zero_grad(set_to_none=True)
+            if USE_AMP:
+                with torch.amp.autocast('cuda'):
+                    out = model(x)
+                    loss = lam*criterion(out,ya)+(1-lam)*criterion(out,yb) if ma else criterion(out,y)
+                scaler.scale(loss).backward()
+                if GRAD_CLIP>0: scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                scaler.step(opt); scaler.update()
+            else:
+                out = model(x)
+                loss = lam*criterion(out,ya)+(1-lam)*criterion(out,yb) if ma else criterion(out,y)
+                loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP); opt.step()
+            tl_ += loss.item()
+        sch.step()
 
-        for images, targets in train_loader:
-            images = images.to(DEVICE)
-            targets = targets.to(DEVICE)
-
-            optimizer.zero_grad(set_to_none=True)
-
-            with autocast(enabled=torch.cuda.is_available()):
-                outputs = model(images)
-                loss = criterion(outputs, targets)
-
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-
-            train_loss += loss.item()
-
-        scheduler.step()
-
-        # ---- Validate ----
         if val_loader:
-            model.eval()
-            val_preds, val_targets = [], []
-
+            model.eval(); vp, vt = [], []
             with torch.no_grad():
-                for images, targets in val_loader:
-                    images = images.to(DEVICE)
-                    outputs = model(images)
-                    _, preds = torch.max(outputs, 1)
-                    val_preds.extend(preds.cpu().numpy())
-                    val_targets.extend(targets.numpy())
-
-            val_f1 = f1_score(val_targets, val_preds, average="macro")
-            print(f"Epoch {epoch+1}/{NUM_EPOCHS} | "
-                  f"Loss: {train_loss/len(train_loader):.4f} | "
-                  f"Val F1: {val_f1:.4f}")
-
-            if val_f1 > best_f1:
-                best_f1 = val_f1
-                torch.save(model.state_dict(), "best_model.pth")
+                for x, y in val_loader:
+                    out = model(x.to(DEVICE)); vp.extend(out.argmax(1).cpu().numpy()); vt.extend(y.numpy())
+            f1 = f1_score(vt, vp, average="macro")
+            print(f"E{ep+1:3d}/{NUM_EPOCHS} | loss={tl_/len(train_loader):.4f} | f1={f1:.4f}")
+            if f1 > best_f1:
+                best_f1 = f1; torch.save({"model":model.state_dict(),"f1":f1}, "best_model.pth")
         else:
-            print(f"Epoch {epoch+1}/{NUM_EPOCHS} | Loss: {train_loss/len(train_loader):.4f}")
-
+            print(f"E{ep+1:3d}/{NUM_EPOCHS} | loss={tl_/len(train_loader):.4f}")
     return model
 
-
-# ============================================================
-# 平台标准预测函数 (可能被平台自动调用)
-# ============================================================
+# ============ Predict ============
+TTA_SIZE = int(IMAGE_SIZE * 1.14)
 
 def predict(test_dataset, model_path="best_model.pth"):
-    """
-    智海Mo平台推理接口
-
-    Args:
-        test_dataset: 平台提供的测试数据集
-        model_path: 模型权重路径
-    Returns:
-        predictions: list of class indices
-    """
-    # 加载模型
     model = build_model()
     if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+        ckpt = torch.load(model_path, map_location=DEVICE, weights_only=False)
+        model.load_state_dict(ckpt.get("model", ckpt))
 
-    model.eval()
+    # TTA transforms
+    to_tensor = transforms.ToTensor()
+    norm = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-    # 包装数据
-    if hasattr(test_dataset, '__getitem__'):
-        test_loader = DataLoader(
-            test_dataset, batch_size=128, shuffle=False,
-            num_workers=2, pin_memory=True,
-        )
-    else:
-        raise ValueError("test_dataset 格式不支持")
+    def tta_predict(img):
+        if isinstance(img, np.ndarray): img = Image.fromarray(img)
+        elif isinstance(img, str): img = Image.open(img).convert("RGB")
+        img_r = transforms.Resize(TTA_SIZE)(img)
+        crops = transforms.FiveCrop(IMAGE_SIZE)(img_r)
+        probs = []
+        for crop in crops:
+            for flip in [False, True]:
+                c = transforms.RandomHorizontalFlip(p=1.0)(crop) if flip else crop
+                t = norm(to_tensor(c)).unsqueeze(0).to(DEVICE)
+                with torch.no_grad(): probs.append(torch.softmax(model(t), 1))
+        return torch.cat(probs).mean(0)
 
-    all_preds = []
-
+    test_loader = DataLoader(test_dataset, BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+    model.eval(); all_preds = []
     with torch.no_grad():
         for images, _ in test_loader:
-            images = images.to(DEVICE)
-            outputs = model(images)
-            _, preds = torch.max(outputs, 1)
-            all_preds.extend(preds.cpu().numpy().tolist())
-
+            for i in range(len(images)):
+                prob = tta_predict(images[i].cpu().numpy() if torch.is_tensor(images[i]) else images[i])
+                all_preds.append(prob.argmax().item())
     return all_preds
-
-
-# ============================================================
-# 本地测试
-# ============================================================
-
-if __name__ == "__main__":
-    print(f"智海Mo平台适配脚本已就绪")
-    print(f"Device: {DEVICE}")
-    print(f"类别: {CLASS_NAMES}")
-
-    # 测试模型构建
-    model = build_model()
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"模型参数量: {total_params/1e6:.2f}M")
-
-    # 测试推理速度
-    dummy_input = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE).to(DEVICE)
-    model.eval()
-    with torch.no_grad():
-        # Warmup
-        for _ in range(10):
-            _ = model(dummy_input)
-        # 计时
-        import time
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
-        start = time.time()
-        for _ in range(100):
-            _ = model(dummy_input)
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
-        elapsed = time.time() - start
-
-    print(f"推理速度: {elapsed/100*1000:.2f}ms/image (avg over 100 runs)")
