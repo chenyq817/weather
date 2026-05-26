@@ -274,14 +274,63 @@ if __name__ == "__main__":
         data_root = os.environ.get("DATA_DIR", "")
 
     if not data_root or not os.path.isdir(data_root):
-        print(f"ERROR: Data path '{data_root}' not found.")
-        print("Usage: python mo_platform_entry.py <data_directory>")
-        print("Example: python mo_platform_entry.py -d/weather_classification")
-        print("\nListing filesystem for reference:")
-        for d in ["/home/jovyan", "/home/jovyan/data", "-d", "/data", "/dataset", "."]:
-            if os.path.isdir(d):
-                print(f"  {d}/: {os.listdir(d)[:15]}")
-        sys.exit(1)
+        print(f"Path '{data_root}' not found, auto-searching...")
+        # 广度搜索: 在整个文件系统中找包含 weather_classification 或 cloudy 目录的路径
+        found = None
+        import subprocess
+        # 方法1: find命令
+        try:
+            r = subprocess.run(["find", "/", "-maxdepth", "5", "-type", "d", "-name", "cloudy"],
+                              capture_output=True, text=True, timeout=20)
+            for line in r.stdout.strip().split("\n"):
+                line = line.strip()
+                if line and os.path.isdir(line):
+                    p = os.path.dirname(line)
+                    if any(c in os.listdir(p) for c in ["rainy", "snow"]):
+                        found = p
+                        print(f"  Found via find: {found}")
+                        break
+        except: pass
+
+        # 方法2: 手动遍历关键目录
+        if not found:
+            search_roots = ["/", "/home", "/home/jovyan", "/data", "/dataset", "/mnt", "/opt", "-d", "."]
+            for root in search_roots:
+                if not os.path.isdir(root): continue
+                try:
+                    for item in os.listdir(root):
+                        full = os.path.join(root, item)
+                        if os.path.isdir(full):
+                            if os.path.isdir(os.path.join(full, "cloudy")):
+                                found = full
+                                print(f"  Found: {found}")
+                                break
+                except: pass
+                if found: break
+
+        # 方法3: 找任何包含 zip/tar 的目录（数据集可能未解压）
+        if not found:
+            print("  No dataset dir found. Checking for archives...")
+            try:
+                r = subprocess.run(["find", "/home", "/data", "/dataset", "-maxdepth", "4",
+                                   "-type", "f", "-name", "*.zip", "-o", "-name", "*.tar*"],
+                                  capture_output=True, text=True, timeout=15)
+                for line in r.stdout.strip().split("\n"):
+                    if line.strip():
+                        print(f"  Archive: {line.strip()}")
+            except: pass
+
+        if found:
+            data_root = found
+        else:
+            print("ERROR: Cannot find dataset anywhere.")
+            print("Make sure to CHECK the 'dataset' checkbox when creating the task!")
+            print("\nFilesystem overview:")
+            for d in ["/home/jovyan", "/data", "/dataset", "/mnt", "."]:
+                if os.path.isdir(d):
+                    items = os.listdir(d)[:15]
+                    print(f"  {d}/: {items}")
+            sys.exit(1)
 
     print(f"Data root: {data_root}")
 
