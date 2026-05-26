@@ -58,7 +58,8 @@ def cutmix_data(x, y, alpha):
     return mx, y, y[idx], 1 - (x1-x0)*(y1-y0)/(H*W)
 
 # ============ Model ============
-def build_model():
+def build_model(pretrained_path=None):
+    """构建模型，可选加载天气预训练权重"""
     model = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
     inf = model.classifier[2].in_features  # 768
     model.classifier = nn.Sequential(
@@ -66,6 +67,17 @@ def build_model():
         nn.Dropout(0.4), nn.Linear(inf, 256),
         nn.GELU(), nn.Dropout(0.25), nn.Linear(256, NUM_CLASSES),
     )
+    if pretrained_path and os.path.exists(pretrained_path):
+        print(f"Loading pretrained weights: {pretrained_path}")
+        ckpt = torch.load(pretrained_path, map_location=DEVICE, weights_only=False)
+        model.load_state_dict(ckpt.get("model", ckpt))
+        # 重新随机初始化分类头 (适应新数据分布)
+        model.classifier = nn.Sequential(
+            nn.Flatten(1), nn.LayerNorm(inf, eps=1e-6),
+            nn.Dropout(0.4), nn.Linear(inf, 256),
+            nn.GELU(), nn.Dropout(0.25), nn.Linear(256, NUM_CLASSES),
+        )
+        print("Classifier head re-initialized, backbone kept.")
     return model.to(DEVICE)
 
 # ============ Dataset wrapper ============
@@ -141,6 +153,69 @@ def train(train_dataset, val_dataset=None):
                 best_f1 = f1; torch.save({"model":model.state_dict(),"f1":f1}, "best_model.pth")
         else:
             print(f"E{ep+1:3d}/{NUM_EPOCHS} | loss={tl_/len(train_loader):.4f}")
+    return model
+
+# ============ Train with Pretrained Weights ============
+def train_with_pretrained(train_dataset, val_dataset=None,
+                           pretrained_path="output/best_model_v10_convnext_s456.pth"):
+    """加载天气预训练权重, 在新数据集上微调"""
+    PT_LR = 3e-4      # 更低的head LR (backbone已适应天气)
+    PT_FINE_LR = 1e-5 # 更低的backbone LR
+
+    train_loader = DataLoader(train_dataset, BATCH_SIZE, shuffle=True,
+                               num_workers=2, pin_memory=True, drop_last=True)
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = DataLoader(val_dataset, BATCH_SIZE, shuffle=False,
+                                 num_workers=2, pin_memory=True)
+
+    print(f"Fine-tuning from: {pretrained_path}")
+    model = build_model(pretrained_path=pretrained_path)
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
+    scaler = torch.amp.GradScaler() if USE_AMP else None
+
+    # 直接用分组学习率 (backbone已适应, 不需要warmup冻结)
+    for p in model.parameters(): p.requires_grad = True
+    hp = [p for n,p in model.named_parameters() if "classifier" in n]
+    bp = [p for n,p in model.named_parameters() if "classifier" not in n]
+    opt = optim.AdamW([{"params":hp,"lr":PT_LR},{"params":bp,"lr":PT_FINE_LR}], weight_decay=WD)
+    sch = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=5, T_mult=2, eta_min=1e-6)
+
+    best_f1 = 0.0
+    for ep in range(NUM_EPOCHS):
+        model.train(); tl_ = 0.0
+        for x, y in train_loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            ma = torch.rand(1).item() < MIXUP_P
+            if ma:
+                if torch.rand(1).item() < 0.6: x, ya, yb, lam = mixup_data(x, y, MIXUP_A)
+                else: x, ya, yb, lam = cutmix_data(x, y, CUTMIX_A)
+            opt.zero_grad(set_to_none=True)
+            if USE_AMP:
+                with torch.amp.autocast('cuda'):
+                    out = model(x)
+                    loss = lam*criterion(out,ya)+(1-lam)*criterion(out,yb) if ma else criterion(out,y)
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                scaler.step(opt); scaler.update()
+            else:
+                out = model(x)
+                loss = lam*criterion(out,ya)+(1-lam)*criterion(out,yb) if ma else criterion(out,y)
+                loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP); opt.step()
+            tl_ += loss.item()
+        sch.step()
+
+        if val_loader:
+            model.eval(); vp, vt = [], []
+            with torch.no_grad():
+                for x, y in val_loader:
+                    out = model(x.to(DEVICE)); vp.extend(out.argmax(1).cpu().numpy()); vt.extend(y.numpy())
+            f1 = f1_score(vt, vp, average="macro")
+            print(f"FT E{ep+1:3d}/{NUM_EPOCHS} | loss={tl_/len(train_loader):.4f} | f1={f1:.4f}")
+            if f1 > best_f1:
+                best_f1 = f1; torch.save({"model":model.state_dict(),"f1":f1}, "best_model.pth")
+        else:
+            print(f"FT E{ep+1:3d}/{NUM_EPOCHS} | loss={tl_/len(train_loader):.4f}")
     return model
 
 # ============ Predict ============
