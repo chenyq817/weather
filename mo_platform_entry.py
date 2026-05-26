@@ -92,11 +92,10 @@ class PlatformDataset(Dataset):
         if self.transform: img = self.transform(img)
         return img, self.labels[idx]
 
-# ============ Train (默认: 加载预训练权重微调) ============
-def train(train_dataset, val_dataset=None,
-          pretrained_path="output/best_model_v10_convnext_s456.pth"):
-    """默认使用天气预训练权重在新数据上微调 (更快收敛, 更好泛化)"""
-    return train_with_pretrained(train_dataset, val_dataset, pretrained_path)
+# ============ Train (默认: ImageNet从头训练, 同数据集不用预训练) ============
+def train(train_dataset, val_dataset=None):
+    """默认从ImageNet从头训练 (同数据集不用预训练权重)"""
+    return train_from_scratch(train_dataset, val_dataset)
 
 def train_from_scratch(train_dataset, val_dataset=None):
     """从ImageNet从头训练 (不使用天气预训练)"""

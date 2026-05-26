@@ -16,11 +16,12 @@ from sklearn.model_selection import train_test_split
 DATA_DIR = "-d/weather_classification"          # MO平台数据路径
 TRAIN_PER_CLASS = 800                           # 训练集每类数量
 TEST_PER_CLASS = 200                            # 测试集每类数量
-PRETRAINED_MODEL = "output/best_model_v10_convnext_s456.pth"  # 预训练权重(上传到MO平台)
+USE_PRETRAINED = False                          # 是否加载天气预训练权重 (同数据=False)
+PRETRAINED_MODEL = "output/best_model_v10_convnext_s456.pth"  # 预训练权重路径
 OUTPUT_MODEL = "best_model_mo.pth"              # 输出模型名
 
-IMAGE_SIZE = 260; BATCH_SIZE = 32; NUM_EPOCHS = 30
-LR = 3e-4; FINE_LR = 1e-5; WD = 3e-4           # 更低LR (backbone已预训练)
+IMAGE_SIZE = 260; BATCH_SIZE = 32; NUM_EPOCHS = 40; WARMUP_EPOCHS = 3
+LR = 8e-4; FINE_LR = 3e-5; WD = 3e-4           # 标准LR (ImageNet初始化)
 LABEL_SMOOTH = 0.1; MIXUP_A = 0.3; CUTMIX_A = 0.2; MIXUP_P = 0.7
 GRAD_CLIP = 1.0
 
@@ -127,24 +128,24 @@ def cutmix(x, y, a):
     return mx, y, y[idx], 1-(x1-x0)*(y1-y0)/(H*W)
 
 # ============ Model ============
-def build_model(pretrained_path=None):
-    model = models.convnext_tiny(weights=None)  # no ImageNet, we load our own
+def build_model(use_pretrained=False, pretrained_path=None):
+    if use_pretrained and pretrained_path and os.path.exists(pretrained_path):
+        # 加载天气预训练权重, 重新初始化分类头
+        model = models.convnext_tiny(weights=None)
+        print(f"Loading pretrained: {pretrained_path}")
+        ckpt = torch.load(pretrained_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt.get("model", ckpt))
+    else:
+        # ImageNet 预训练初始化
+        model = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        print("Using ImageNet pretrained weights")
+
     inf = model.classifier[2].in_features
     model.classifier = nn.Sequential(
         nn.Flatten(1), nn.LayerNorm(inf, eps=1e-6),
         nn.Dropout(0.4), nn.Linear(inf, 256),
         nn.GELU(), nn.Dropout(0.25), nn.Linear(256, NUM_CLASSES),
     )
-    if pretrained_path and os.path.exists(pretrained_path):
-        print(f"Loading pretrained: {pretrained_path}")
-        ckpt = torch.load(pretrained_path, map_location="cpu", weights_only=False)
-        model.load_state_dict(ckpt.get("model", ckpt))
-        # 重新初始化分类头
-        model.classifier = nn.Sequential(
-            nn.Flatten(1), nn.LayerNorm(inf, eps=1e-6),
-            nn.Dropout(0.4), nn.Linear(inf, 256),
-            nn.GELU(), nn.Dropout(0.25), nn.Linear(256, NUM_CLASSES),
-        )
     return model.to(DEVICE)
 
 # ============ TTA ============
@@ -181,22 +182,39 @@ if __name__ == "__main__":
     tl = DataLoader(tr_ds, BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True, drop_last=True)
     vl = DataLoader(vl_ds, BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
 
-    # Step 3: 构建模型(加载预训练权重)
-    model = build_model(pretrained_path=PRETRAINED_MODEL)
+    # Step 3: 构建模型
+    model = build_model(use_pretrained=USE_PRETRAINED, pretrained_path=PRETRAINED_MODEL)
     print(f"Params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
     # Step 4: 训练
     criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
-    for p in model.parameters(): p.requires_grad = True
-    hp = [p for n,p in model.named_parameters() if "classifier" in n]
-    bp = [p for n,p in model.named_parameters() if "classifier" not in n]
-    opt = optim.AdamW([{"params":hp,"lr":LR},{"params":bp,"lr":FINE_LR}], weight_decay=WD)
-    sch = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=5, T_mult=2, eta_min=1e-6)
-    scaler = torch.amp.GradScaler() if DEVICE.type == "cuda" else None
 
+    if USE_PRETRAINED:
+        # 预训练微调: 直接分组LR, 无warmup
+        for p in model.parameters(): p.requires_grad = True
+        hp = [p for n,p in model.named_parameters() if "classifier" in n]
+        bp = [p for n,p in model.named_parameters() if "classifier" not in n]
+        opt = optim.AdamW([{"params":hp,"lr":LR},{"params":bp,"lr":FINE_LR}], weight_decay=WD)
+        sch = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=5, T_mult=2, eta_min=1e-6)
+    else:
+        # 从头训练: warmup冻结backbone
+        for n, p in model.named_parameters(): p.requires_grad = "classifier" in n
+        opt = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=LR, weight_decay=WD)
+        sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=NUM_EPOCHS, eta_min=1e-6)
+
+    scaler = torch.amp.GradScaler() if DEVICE.type == "cuda" else None
     best_f1, best_ep, es_cnt = 0.0, 0, 0
     t0 = time.time()
     for ep in range(NUM_EPOCHS):
+        # 从头训练时的warmup
+        if not USE_PRETRAINED and ep == WARMUP_EPOCHS:
+            print(f"E{ep+1}: Unfreeze backbone")
+            for p in model.parameters(): p.requires_grad = True
+            hp = [p for n,p in model.named_parameters() if "classifier" in n]
+            bp = [p for n,p in model.named_parameters() if "classifier" not in n]
+            opt = optim.AdamW([{"params":hp,"lr":LR},{"params":bp,"lr":FINE_LR}], weight_decay=WD)
+            sch = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=5, T_mult=2, eta_min=1e-6)
+
         model.train(); tl_ = 0.0
         for x, y in tl:
             x, y = x.to(DEVICE), y.to(DEVICE)
